@@ -1,0 +1,316 @@
+# ==============================
+# main.py  –  FastAPI 서버 진입점
+# ==============================
+import asyncio
+import json
+import logging
+import os
+import uuid
+from pathlib import Path
+
+from fastapi import FastAPI, File, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import settings
+from app.schemas import JobStatusResponse, ProcessStartResponse, ProcessResponse, HistoryItemResponse
+from database import Base, 엔진, SessionLocal
+from models import Category, Document, Job
+from document_pipeline import run_document_pipeline
+from llm_chain import run as llm_run
+from datetime import datetime
+from sqlalchemy import or_
+
+# ── 로깅 ────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+)
+logger = logging.getLogger("main")
+
+# ── DB 테이블 자동 생성 ──────────────────────────────────────────────────
+Base.metadata.create_all(bind=엔진)
+
+# ── 폴더 자동 생성 ───────────────────────────────────────────────────────
+UPLOAD_DIR = Path(settings.upload_dir)
+JSON_DIR   = Path(settings.ocr_output_dir)
+for _d in [UPLOAD_DIR, JSON_DIR]:
+    _d.mkdir(parents=True, exist_ok=True)
+
+# ── FastAPI 앱 ───────────────────────────────────────────────────────────
+app = FastAPI(title=settings.app_name)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Job 상태 저장소 (in-memory) ──────────────────────────────────────────
+jobs: dict[str, JobStatusResponse] = {}
+
+
+def _update_job(job_id: str, *, status: str, progress: int,
+                stage: str, message: str) -> None:
+    job = jobs[job_id]
+    job.status   = status
+    job.progress = progress
+    job.stage    = stage
+    job.message  = message
+    logger.info("[JOB %s] %s%% %s – %s", job_id, progress, stage, message)
+
+
+async def _run_pipeline(job_id: str, filename: str, file_bytes: bytes) -> None:
+    """
+    전체 파이프라인 비동기 실행.
+
+    1) 파일 저장
+    2) document_pipeline → 각 extractor (퍼널)
+    3) llm_chain         → 요약 + 카테고리 분류
+    4) DB 저장           → Category + Document
+    """
+    job_start_time = datetime.now()
+    ext = Path(filename).suffix.lower().lstrip(".")
+    saved_path = UPLOAD_DIR / f"{job_id}.{ext}"
+    json_path  = JSON_DIR   / f"{job_id}.json"
+    try:
+        # ── STEP 1 : 파일 저장 ─────────────────────────────────────────
+        _update_job(job_id, status="running", progress=5,
+                    stage="upload", message="파일 저장 중")
+        saved_path.write_bytes(file_bytes)
+
+        # ── STEP 2 : 확장자별 추출 (퍼널) ──────────────────────────────
+        _update_job(job_id, status="running", progress=20,
+                    stage="extract", message="문서 텍스트 추출 중")
+
+        loop = asyncio.get_event_loop()
+        extract_result = await loop.run_in_executor(
+            None, run_document_pipeline, saved_path
+        )
+
+        # extractor 결과에서 json_path 확보
+        # pdf_extractor는 json_path를 직접 반환, 나머지는 text를 JSON으로 변환
+        if extract_result and extract_result.get("json_path"):
+            json_path = Path(extract_result["json_path"])
+        else:
+            # pdf 이외 포맷: text를 LLM이 읽을 수 있는 JSON으로 저장
+            text = extract_result.get("text", "") if extract_result else ""
+            if not text:
+                _update_job(job_id, status="failed", progress=100,
+                            stage="failed", message="텍스트를 추출하지 못했습니다.")
+                return
+            pages = [{"page": 1, "method": ext, "content": text}]
+            json_path.write_text(
+                json.dumps(pages, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+
+        # ── STEP 3 : LLM 요약 + 카테고리 분류 ─────────────────────────
+        _update_job(job_id, status="running", progress=60,
+                    stage="llm", message="요약/분류 생성 중")
+        llm_result = await loop.run_in_executor(
+            None, llm_run, str(json_path)
+        )
+        main_category = llm_result.get("main_category", "기타")
+        sub_category  = llm_result.get("sub_category",  "미상")
+        summary       = llm_result.get("summary",       "")
+
+        # ── STEP 4 : PostgreSQL DB 저장 ────────────────────────────────
+        _update_job(job_id, status="running", progress=90,
+                    stage="db", message="DB 저장 중")
+
+        with open(json_path, encoding="utf-8") as f:
+            pages = json.load(f)
+        full_text = "\n\n".join(p["content"] for p in pages)
+
+        db = SessionLocal()
+        try:
+            category = Category(
+                main=main_category,
+                sub=sub_category,
+                extension=ext,
+            )
+            db.add(category)
+            db.flush()
+
+            document = Document(
+                file_name=filename,
+                file_type=ext,
+                file_size=str(os.path.getsize(saved_path)),
+                cat_id=category.cat_id,
+                content_full=full_text,
+                content_sum=summary,
+            )
+            db.add(document)
+            db.flush()
+            
+
+            
+            job_record = Job(
+                job_start=job_start_time,
+                job_finish=datetime.now(),
+                doc_id=document.doc_id,
+                status=True  # 완료
+            )
+            db.add(job_record)
+            db.commit()
+            logger.info("[JOB %s] DB 저장 완료", job_id)
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+        # ── 완료 ───────────────────────────────────────────────────────
+        result = ProcessResponse(
+            filename=filename,
+            raw_text=full_text,
+            ocr_text="",
+            merged_text=full_text,
+            summary=summary,
+            category=main_category,
+            main_category=main_category,
+            sub_category=sub_category,
+        )
+        jobs[job_id].result = result
+        _update_job(job_id, status="completed", progress=100,
+                    stage="completed", message="처리 완료")
+
+    except Exception as exc:
+        logger.exception("[JOB %s] 예상치 못한 오류", job_id)
+        _update_job(job_id, status="failed", progress=100,
+                    stage="failed", message=f"처리 실패: {exc}")
+
+
+# ── 엔드포인트 ───────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok"}
+
+
+@app.post("/api/process/start", response_model=ProcessStartResponse)
+async def start_process(file: UploadFile = File(...)) -> ProcessStartResponse:
+    """파일 업로드 → 비동기 파이프라인 시작 → job_id 반환."""
+    ext = Path(file.filename or "").suffix.lower().lstrip(".")
+    if f".{ext}" not in settings.allowed_ext_set:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=400,
+            detail="hwp, hwpx, pdf, docx, ppt, pptx 파일만 업로드 가능합니다."
+        )
+
+    filename   = file.filename or "unknown"
+    file_bytes = await file.read()
+    job_id     = str(uuid.uuid4())
+
+    jobs[job_id] = JobStatusResponse(
+        job_id=job_id,
+        status="queued",
+        progress=0,
+        stage="queued",
+        message="작업 대기 중",
+        result=None,
+    )
+
+    asyncio.create_task(_run_pipeline(job_id, filename, file_bytes))
+    return ProcessStartResponse(job_id=job_id)
+
+
+@app.get("/api/process/{job_id}", response_model=JobStatusResponse)
+def get_process_status(job_id: str) -> JobStatusResponse:
+    """job_id 기준 처리 상태 조회."""
+    job = jobs.get(job_id)
+    if not job:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="존재하지 않는 job_id 입니다.")
+    return job
+
+
+# DB 조인 결과(Document/Category/Job)를 프론트 이력 응답 스키마로 변환
+# - 처리 시각: job_finish 우선, 없으면 document.saved_time 사용
+# - 상태/진행률: 완료 기본값(100), 진행 중이면 running(50)으로 표시
+# - 카테고리 누락 시 기본값으로 안전하게 대체
+def _history_item_from_row(document: Document, category: Category | None, job: Job | None) -> HistoryItemResponse:
+    processed_at_dt = None
+    if job and job.job_finish:
+        processed_at_dt = job.job_finish
+    elif document.saved_time:
+        processed_at_dt = document.saved_time
+    else:
+        processed_at_dt = datetime.now()
+
+    status = "completed"
+    progress = 100
+    if job is not None and job.status is False:
+        status = "running"
+        progress = 50
+
+    return HistoryItemResponse(
+        id=document.doc_id,
+        filename=document.file_name or "unknown",
+        processed_at=processed_at_dt.isoformat(),
+        main_category=(category.main if category and category.main else "기타"),
+        sub_category=(category.sub if category and category.sub else "미상"),
+        summary=document.content_sum or "",
+        status=status,
+        progress=progress,
+    )
+
+
+@app.get("/api/history", response_model=list[HistoryItemResponse])
+def get_history(limit: int = Query(default=50, ge=1, le=200)) -> list[HistoryItemResponse]:
+    # 처리 이력 목록 조회 API
+    # - Document 기준으로 Category/Job을 LEFT OUTER JOIN
+    # - 최신순 정렬 후 limit 개수만 반환
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(Document, Category, Job)
+            .outerjoin(Category, Document.cat_id == Category.cat_id)
+            .outerjoin(Job, Job.doc_id == Document.doc_id)
+            .order_by(Document.saved_time.desc(), Document.doc_id.desc())
+            .limit(limit)
+            .all()
+        )
+        return [_history_item_from_row(document, category, job) for document, category, job in rows]
+    finally:
+        # DB 세션은 항상 정리
+        db.close()
+
+
+@app.get("/api/history/search", response_model=list[HistoryItemResponse])
+def search_history(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[HistoryItemResponse]:
+    # 처리 이력 검색 API (PostgreSQL 필터 조회)
+    # - 검색 대상: 파일명, 요약, 메인/서브 카테고리
+    # - ILIKE + %키워드% 부분 일치 검색
+    # - 최신순 정렬 후 limit 개수만 반환
+    db = SessionLocal()
+    try:
+        like_q = f"%{q}%"
+        rows = (
+            db.query(Document, Category, Job)
+            .outerjoin(Category, Document.cat_id == Category.cat_id)
+            .outerjoin(Job, Job.doc_id == Document.doc_id)
+            .filter(
+                or_(
+                    Document.file_name.ilike(like_q),
+                    Document.content_sum.ilike(like_q),
+                    Category.main.ilike(like_q),
+                    Category.sub.ilike(like_q),
+                )
+            )
+            .order_by(Document.saved_time.desc(), Document.doc_id.desc())
+            .limit(limit)
+            .all()
+        )
+        return [_history_item_from_row(document, category, job) for document, category, job in rows]
+    finally:
+        # DB 세션은 항상 정리
+        db.close()
+
+
